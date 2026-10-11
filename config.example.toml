@@ -1,0 +1,49 @@
+# Bazel LAN remote cache server — example configuration.
+# Precedence: CLI flags > BAZEL_CACHE_* environment > this file > defaults.
+# Unknown keys and invalid values fail startup; there is no silent fallback.
+
+[server]
+listen = "0.0.0.0:50051"
+# Advertised through GetCapabilities and enforced on BatchRead/BatchUpdateBlobs.
+max_batch_total_size_bytes = "4MiB"
+# Chunk size for ByteStream.Read responses.
+stream_chunk_size_bytes = "1MiB"
+# max_concurrent_streams = 256
+
+[storage]
+root = "/data"                 # holds cas/, tmp/ and metadata.sqlite on one filesystem
+max_size = "800GB"             # CAS payload budget; leave headroom on the device
+durability = "cache"           # "cache" = no per-blob fsync, "strict" = fsync + FULL sync
+
+[eviction]
+policy = "lru"                 # lru | ttl | fifo | none
+high_watermark = 0.90          # start a sweep above this fraction of max_size
+low_watermark = 0.75           # sweep until back under this fraction
+interval = "60s"
+batch_size = 1000
+# ttl = "14d"                  # required when policy = "ttl"
+
+[auth]
+mode = "none"                  # none | token | mtls | oidc
+
+# [auth.token]
+# env = "BAZEL_CACHE_TOKEN"    # or: file = "/run/secrets/cache-token", or value = "..."
+
+# [auth.tls]                   # server TLS; client_ca is required for mode = "mtls"
+# cert = "/etc/bazel-cache/server.crt"
+# key = "/etc/bazel-cache/server.key"
+# client_ca = "/etc/bazel-cache/ca.crt"
+
+# [auth.oidc]
+# issuer = "https://idp.example.com"
+# audience = "bazel-cache"
+# jwks_url = "https://idp.example.com/.well-known/jwks.json"   # default: discovery
+# refresh_interval = "5m"
+
+[metrics]
+enabled = true
+listen = "0.0.0.0:9090"        # /metrics, /health, /ready
+
+[logging]
+level = "info"
+format = "json"                # pretty | json
