@@ -1182,6 +1182,33 @@ strict durability、gc、reindex、stats CLI 均實測通過
 正式 benchmark（與 NativeLink / bazel-remote 比較）尚未進行
 ```
 
+## J. Cashew GPUI desktop / Windows
+
+新增 `desktop-gpui` workspace member，使用與 SwiftCache 相同的 `gpui-kit = 0.9.0`。
+桌面與既有 CLI 共用 `src/server.rs` 的 REAPI cache engine；桌面由專用 Tokio
+執行緒管理服務，不需要 sidecar executable。介面提供總覽、服務設定、最近 200 行日誌，
+設定保存在平台設定目錄下的 `desktop.json`；可用 `CASHEW_DATA_DIR` 隔離設定與預設快取。
+
+桌面預設 100GB、gRPC `127.0.0.1:50051`、metrics `127.0.0.1:9090`，不自動啟動。
+進階認證、TLS、GC、durability 由選填 TOML 載入，介面欄位優先於環境與 TOML。
+服務必須成功 bind 所有啟用的 listener 才回報 Running；啟動錯誤會顯示在介面。
+停止與關閉視窗會等待服務結束、flush access timestamps 並釋放連接埠。
+
+Windows 使用 MSVC / Windows SDK，桌面執行檔為 `cashew.exe`；CLI 保留
+`bazel-cache-server.exe`。檔案 volume ID 透過 Windows handle 查詢，CAS/tmp 必須同卷，
+同卷發布使用 `MoveFileExW`，strict 模式先 flush file contents，再使用
+`MOVEFILE_WRITE_THROUGH`；Unix 保留 rename + directory fsync。Windows reindex 使用
+檔案 creation time；CLI 支援 Windows Ctrl+C、console close/shutdown。
+`.github/workflows/windows.yml` 負責 Windows 測試、release build 與 exe artifacts。
+Windows renderer 與檔案系統仍需 Windows 主機的原生執行驗證。
+
+macOS 原生 GPUI 視窗實測：由介面啟動、停止與重新啟動服務；停止後 gRPC/metrics
+連接埠均關閉，日誌含正常 shutdown。Bazel 9.3.2 冷建置上傳 8MiB 產物，`bazel clean`
+後重建回報 `1 remote cache hit`，兩次產物 SHA-256 相同；介面顯示 3 CAS blobs、
+1 Action Cache result 與 8MiB 上傳/下載。另新增三個生命週期 regression tests，
+涵蓋 gRPC/metrics bind 失敗後的復原、啟動中停止、重啟及 controller drop 後釋放資源。
+
+
 ---
 
 # 21-X. 原始待討論清單（歷史紀錄）

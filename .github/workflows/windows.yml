@@ -1,0 +1,33 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Test cache engine and lifecycle
+        run: cargo test --locked -p bazel-cache-server
+      - name: Build CLI
+        run: cargo build --locked --release -p bazel-cache-server --bin bazel-cache-server
+      - name: Build GPUI desktop
+        run: cargo build --locked --release -p cashew-desktop --bin cashew
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cashew-windows-x86_64
+          if-no-files-found: error
+          path: |
+            target/release/cashew.exe
+            target/release/bazel-cache-server.exe

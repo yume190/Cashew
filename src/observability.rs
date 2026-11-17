@@ -402,6 +402,18 @@ pub async fn serve_http(
     health: Arc<HealthState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind metrics listener on {addr}"))?;
+    serve_http_listener(listener, metrics, health, shutdown).await
+}
+
+pub(crate) async fn serve_http_listener(
+    listener: tokio::net::TcpListener,
+    metrics: Arc<Metrics>,
+    health: Arc<HealthState>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let app = Router::new()
         .route("/", get(root))
         .route("/metrics", get(metrics_handler))
@@ -409,10 +421,7 @@ pub async fn serve_http(
         .route("/ready", get(ready_handler))
         .with_state(HttpState { metrics, health });
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind metrics listener on {addr}"))?;
-    let local = listener.local_addr().unwrap_or(addr);
+    let local = listener.local_addr()?;
     tracing::info!(address = %local, "metrics/health HTTP listener bound");
 
     axum::serve(listener, app)
