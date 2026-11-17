@@ -24,6 +24,26 @@ jobs:
         run: cargo build --locked --release -p bazel-cache-server --bin bazel-cache-server
       - name: Build GPUI desktop
         run: cargo build --locked --release -p cashew-desktop --bin cashew
+      - name: Smoke CLI and native desktop window
+        shell: pwsh
+        run: |
+          $env:CASHEW_DATA_DIR = Join-Path $env:RUNNER_TEMP "cashew-desktop-smoke"
+          & .\target\release\bazel-cache-server.exe --root (Join-Path $env:RUNNER_TEMP "cashew-cli-smoke") stats
+          if ($LASTEXITCODE -ne 0) { throw "CLI stats failed" }
+          $desktop = Start-Process .\target\release\cashew.exe -PassThru
+          try {
+            if (-not $desktop.WaitForInputIdle(30000)) { throw "Desktop did not become idle" }
+            $desktop.Refresh()
+            if ($desktop.HasExited -or $desktop.MainWindowHandle -eq 0) {
+              throw "Desktop exited or did not open a native window"
+            }
+            Write-Host "Native window: $($desktop.MainWindowTitle), PID: $($desktop.Id)"
+            if (-not $desktop.CloseMainWindow()) { throw "Could not close desktop window" }
+            if (-not $desktop.WaitForExit(30000)) { throw "Desktop did not shut down" }
+            if ($desktop.ExitCode -ne 0) { throw "Desktop exit code: $($desktop.ExitCode)" }
+          } finally {
+            if (-not $desktop.HasExited) { Stop-Process -Id $desktop.Id -Force }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: cashew-windows-x86_64
