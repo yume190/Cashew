@@ -18,6 +18,8 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Test cache engine and lifecycle
         run: cargo test --locked -p bazel-cache-server
       - name: Build CLI

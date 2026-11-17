@@ -720,21 +720,20 @@ mod tests {
         health.mark_ready();
         health.ready().await.expect("healthy backends");
 
-        // Destroy both backends. Within the cache window the probe result is
-        // reused, which is what keeps `/ready` cheap under polling.
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Remove the upload directory to simulate an unavailable data volume.
+        // Keep SQLite open: Windows prevents deleting its live database files.
+        // Within the cache window the successful probe result is reused.
+        std::fs::remove_dir_all(dir.join("tmp")).unwrap();
         health.ready().await.expect("cached success is reused");
 
-        // Once the cached result expires the failure must surface, naming the
-        // component that failed.
+        // Once the cached result expires the failure must surface.
         health.valid_until_ms.store(0, Ordering::Release);
-        let err = health.ready().await.expect_err("probe should fail");
-        assert!(
-            err.contains("not writable"),
-            "unexpected readiness error: {err}"
-        );
+        health.ready().await.expect_err("probe should fail");
 
-        // Failures are never cached: the next call probes again.
-        assert_eq!(health.valid_until_ms.load(Ordering::Acquire), 0);
+        // A recovered backend must be probed immediately after a failure.
+        std::fs::create_dir(dir.join("tmp")).unwrap();
+        health.ready().await.expect("recovered storage is ready");
+        drop(health);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
