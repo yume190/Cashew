@@ -73,9 +73,13 @@ cargo build --locked --release -p bazel-cache-server --bin bazel-cache-server
 The Windows CLI defaults its storage root to the user's platform cache directory;
 Unix CLI/container defaults remain `/data`. CLI shutdown handles Ctrl+C and Windows
 console close/shutdown events. The Windows GitHub Actions workflow tests the cache
-engine and desktop lifecycle, builds both executables, and uploads them together
-as `cashew-windows-x86_64`. Windows execution must be verified on a Windows host;
-building the macOS app does not validate the Windows renderer or storage APIs.
+engine and desktop lifecycle, builds both executables, exercises CLI `stats`, opens
+and closes the native desktop window, and uploads the executables together as
+`cashew-windows-x86_64`.
+
+[Verified Windows build and executable download](https://github.com/yume190/Cashew/actions/runs/44065718140/artifacts/14321443088):
+92 engine tests + 3 desktop lifecycle tests passed on the native Windows runner;
+both release executables built, and the Cashew window opened and exited normally.
 
 ## Run
 

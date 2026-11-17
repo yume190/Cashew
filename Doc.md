@@ -1200,7 +1200,10 @@ Windows 使用 MSVC / Windows SDK，桌面執行檔為 `cashew.exe`；CLI 保留
 `MOVEFILE_WRITE_THROUGH`；Unix 保留 rename + directory fsync。Windows reindex 使用
 檔案 creation time；CLI 支援 Windows Ctrl+C、console close/shutdown。
 `.github/workflows/windows.yml` 負責 Windows 測試、release build 與 exe artifacts。
-Windows renderer 與檔案系統仍需 Windows 主機的原生執行驗證。
+Windows 原生驗證已通過：[GitHub Actions run 44065718140](https://github.com/yume190/Cashew/actions/runs/44065718140)。
+92 個 engine tests、3 個 desktop lifecycle tests 全數通過，CLI / GPUI release
+執行檔均建置成功；CLI `stats` 實跑成功，`cashew.exe` 建立標題為 Cashew 的原生視窗，
+送出關閉事件後以 exit code 0 結束。兩個 exe 已上傳為 `cashew-windows-x86_64` artifact。
 
 macOS 原生 GPUI 視窗實測：由介面啟動、停止與重新啟動服務；停止後 gRPC/metrics
 連接埠均關閉，日誌含正常 shutdown。Bazel 9.3.2 冷建置上傳 8MiB 產物，`bazel clean`
