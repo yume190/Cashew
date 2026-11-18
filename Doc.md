@@ -1182,6 +1182,73 @@ strict durability、gc、reindex、stats CLI 均實測通過
 正式 benchmark（與 NativeLink / bazel-remote 比較）尚未進行
 ```
 
+## J. Cashew GPUI desktop / Windows
+
+新增 `desktop-gpui` workspace member，使用與 SwiftCache 相同的 `gpui-kit = 0.9.0`。
+桌面與既有 CLI 共用 `src/server.rs` 的 REAPI cache engine；桌面由專用 Tokio
+執行緒管理服務，不需要 sidecar executable。介面提供總覽、服務設定、最近 200 行日誌，
+設定保存在平台設定目錄下的 `desktop.json`；可用 `CASHEW_DATA_DIR` 隔離設定與預設快取。
+
+桌面預設 100GB、gRPC `127.0.0.1:50051`、metrics `127.0.0.1:9090`，不自動啟動。
+進階認證、TLS、GC、durability 由選填 TOML 載入，介面欄位優先於環境與 TOML。
+服務必須成功 bind 所有啟用的 listener 才回報 Running；啟動錯誤會顯示在介面。
+停止與關閉視窗會等待服務結束、flush access timestamps 並釋放連接埠。
+
+Windows 使用 MSVC / Windows SDK，桌面執行檔為 `cashew.exe`；CLI 保留
+`bazel-cache-server.exe`。檔案 volume ID 透過 Windows handle 查詢，CAS/tmp 必須同卷，
+同卷發布使用 `MoveFileExW`，strict 模式先 flush file contents，再使用
+`MOVEFILE_WRITE_THROUGH`；Unix 保留 rename + directory fsync。Windows reindex 使用
+檔案 creation time；CLI 支援 Windows Ctrl+C、console close/shutdown。
+`.github/workflows/windows.yml` 負責 Windows 測試、release build 與 exe artifacts。
+Windows 原生驗證已通過：[GitHub Actions run 44065718140](https://github.com/yume190/Cashew/actions/runs/44065718140)。
+92 個 engine tests、3 個 desktop lifecycle tests 全數通過，CLI / GPUI release
+執行檔均建置成功；CLI `stats` 實跑成功，`cashew.exe` 建立標題為 Cashew 的原生視窗，
+送出關閉事件後以 exit code 0 結束。兩個 exe 已上傳為 `cashew-windows-x86_64` artifact。
+
+macOS 原生 GPUI 視窗實測：由介面啟動、停止與重新啟動服務；停止後 gRPC/metrics
+連接埠均關閉，日誌含正常 shutdown。Bazel 9.3.2 冷建置上傳 8MiB 產物，`bazel clean`
+後重建回報 `1 remote cache hit`，兩次產物 SHA-256 相同；介面顯示 3 CAS blobs、
+1 Action Cache result 與 8MiB 上傳/下載。另新增三個生命週期 regression tests，
+涵蓋 gRPC/metrics bind 失敗後的復原、啟動中停止、重啟及 controller drop 後釋放資源。
+
+## K. 桌面設定與流量事件
+
+服務設定將監聽範圍與 Port 分開：僅本機 `127.0.0.1`、區網 `0.0.0.0`、自訂 IP；
+儲存位置可輸入或選擇資料夾。有效內容停止輸入 400ms 後自動保存，離開時補寫待儲存內容，
+並明示保存狀態。錯誤內容不覆寫上一份設定。JSON 以同目錄暫存檔完整寫入、同步，再 atomic replace。
+外觀在「設定」頁選擇跟隨系統、淺色、深色，立即套用並保存於獨立的 `appearance.json`。
+
+區網模式仍 bind `0.0.0.0`，但總覽與複製的 client URL 使用偵測到的本機區網 IP。
+找不到可用位址時顯示原因，不提供 wildcard／loopback 的假替代連線位址。
+
+「流量／事件」以每條 TCP/gRPC 連線為 session，接受連線時建立獨立 ID，保留遠端 IP:port，
+同一 IP 的重連與同時連線不會合併。主清單顯示連線中／已關閉、雙向即時速率與累計資料量、
+Upload / Query / Download 已完成 RPC 次數；只有 Download 操作的 session 明示「僅下載」。
+點選 session 查看開始、結束、最後活動、時長，以及各次 RPC 的結果、payload、耗時與 digest／批次明細。
+保留所有使用中的 session 與最近 200 條已關閉 session，每條各保留最新 200 筆操作；
+操作累計不受明細保留上限影響。停止後仍能切換查看所有保留的 session，下一次啟動才清除。
+
+網路統計直接量測 socket 讀寫，含 HTTP/2 / TLS 通訊開銷，不含 TCP/IP 標頭；
+client → cache 是上傳，cache → client 是下載。控制訊框不算 Upload RPC，
+所以僅下載 session 仍可能有少量上行網路位元組。總覽維持 CAS payload 統計，操作明細另列 payload。
+傳輸尚未完成時就更新網路速率。ByteStream download 在真正結束、錯誤或取消時記錄事件。
+事件與 session 蒐集只在桌面啟用；CLI 不建立 session registry 或操作 ring。
+
+參考 [GlassWire](https://www.glasswire.com/userguide/)、
+[NetLimiter](https://netlimiter.com/docs/user-gui-client/child-windows/connection-log)、
+[Little Snitch](https://help.obdev.at/littlesnitch7/monitor-connection-list)：
+優先呈現連線歸屬、雙向速率／累計、連線生命週期與可展開的操作明細。
+
+本次實測一般 gRPC 與 mTLS：一條連線完成 Query ×2、Upload ×1、Download ×1，
+另一條只有 Download ×1；兩次 8MiB 下載 SHA-256 一致，串流上傳尚未完成即觀察到速率。
+個別關閉連線、明暗模式、920px／1180px 視窗、篩選及停止後切換歷史均走過原生 GPUI。
+macOS 當時鎖定且螢幕休眠，未能擷取畫面；未宣稱完成本次截圖視覺檢查。
+
+Windows 圖示由 `desktop-gpui/build.rs` 將多尺寸 `assets/cashew.ico` 嵌入 numeric resource 1，
+符合 GPUI Windows backend 的載入方式；原生 CI 同時檢查 PE resource 與視窗 class icon。
+
+
+
 ---
 
 # 21-X. 原始待討論清單（歷史紀錄）

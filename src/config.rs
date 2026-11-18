@@ -52,7 +52,7 @@ pub struct StorageConfig {
 pub enum Durability {
     /// No per-blob fsync; data is rebuildable by Bazel.
     Cache,
-    /// fsync file, atomic rename, fsync parent dir, SQLite FULL sync.
+    /// Fsync file, durable publication (Unix directory sync / Windows write-through), SQLite FULL.
     Strict,
 }
 
@@ -170,11 +170,22 @@ impl Default for ServerConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            root: PathBuf::from("/data"),
+            root: default_storage_root(),
             max_size: 800 * 1000 * 1000 * 1000,
             durability: Durability::Cache,
         }
     }
+}
+
+fn default_storage_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        directories::ProjectDirs::from("dev", "yume", "Cashew")
+            .expect("Windows user profile must be available")
+            .cache_dir().to_path_buf()
+    }
+    #[cfg(not(windows))]
+    { PathBuf::from("/data") }
 }
 
 impl Default for EvictionConfig {

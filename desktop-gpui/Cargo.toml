@@ -1,0 +1,24 @@
+[package]
+name = "cashew-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Cashew native GPUI remote cache manager"
+
+[[bin]]
+name = "cashew"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bazel-cache-server = { path = ".." }
+chrono = "0.4"
+directories = "6"
+gpui-kit = "=0.9.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smol = "2"
+tempfile = "3"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

@@ -1,0 +1,98 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Test cache engine and lifecycle
+        run: cargo test --locked -p bazel-cache-server
+      - name: Build CLI
+        run: cargo build --locked --release -p bazel-cache-server --bin bazel-cache-server
+      - name: Build GPUI desktop
+        run: cargo build --locked --release -p cashew-desktop --bin cashew
+      - name: Test desktop settings persistence
+        run: cargo test --locked --release -p cashew-desktop --bin cashew
+      - name: Smoke CLI and native desktop window
+        shell: pwsh
+        run: |
+          $env:CASHEW_DATA_DIR = Join-Path $env:RUNNER_TEMP "cashew-desktop-smoke"
+          & .\target\release\bazel-cache-server.exe --root (Join-Path $env:RUNNER_TEMP "cashew-cli-smoke") stats
+          if ($LASTEXITCODE -ne 0) { throw "CLI stats failed" }
+          $exe = (Resolve-Path .\target\release\cashew.exe).Path
+          $win32 = @(
+            '[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);'
+            '[DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr icon);'
+            '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr LoadLibraryEx(string file, IntPtr reserved, uint flags);'
+            '[DllImport("kernel32.dll")] public static extern bool FreeLibrary(IntPtr module);'
+            '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr FindResource(IntPtr module, IntPtr name, IntPtr type);'
+            '[DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")] public static extern IntPtr GetClassLongPtr(IntPtr hwnd, int index);'
+          ) -join "`n"
+          Add-Type -Namespace Native -Name Win32 -MemberDefinition $win32
+          $iconCount = [Native.Win32]::ExtractIconEx($exe, -1, $null, $null, 0)
+          if ($iconCount -lt 1) { throw "cashew.exe has no embedded icon" }
+          $large = New-Object IntPtr[] 1
+          if ([Native.Win32]::ExtractIconEx($exe, 0, $large, $null, 1) -ne 1 -or $large[0] -eq [IntPtr]::Zero) {
+            throw "Could not extract cashew.exe icon"
+          }
+          [void][Native.Win32]::DestroyIcon($large[0])
+          $module = [Native.Win32]::LoadLibraryEx($exe, [IntPtr]::Zero, 2)
+          if ($module -eq [IntPtr]::Zero) { throw "Could not load cashew.exe resources" }
+          try {
+            # GPUI loads numeric icon resource 1; RT_GROUP_ICON is 14.
+            if ([Native.Win32]::FindResource($module, [IntPtr]1, [IntPtr]14) -eq [IntPtr]::Zero) {
+              throw "cashew.exe is missing RT_GROUP_ICON resource 1"
+            }
+          } finally {
+            [void][Native.Win32]::FreeLibrary($module)
+          }
+          Write-Host "Embedded icon groups: $iconCount"
+          $stdout = Join-Path $env:RUNNER_TEMP "cashew-desktop-stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "cashew-desktop-stderr.log"
+          $desktop = Start-Process .\target\release\cashew.exe -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          try {
+            $startup = [Diagnostics.Stopwatch]::StartNew()
+            while ($true) {
+              $desktop.Refresh()
+              if ($desktop.HasExited) { throw "Desktop exited during startup: $($desktop.ExitCode)" }
+              if ($desktop.MainWindowHandle -ne [IntPtr]::Zero) { break }
+              if ($startup.Elapsed.TotalSeconds -ge 30) { throw "Desktop did not open a native window within 30 seconds" }
+              Start-Sleep -Milliseconds 100
+            }
+            Write-Host "Native window: $($desktop.MainWindowTitle), PID: $($desktop.Id)"
+            $classIcon = [Native.Win32]::GetClassLongPtr($desktop.MainWindowHandle, -14)
+            if ($classIcon -eq [IntPtr]::Zero) {
+              throw "Native GPUI window has no class icon"
+            }
+            Write-Host "Window class icon: $classIcon"
+            if (-not $desktop.CloseMainWindow()) { throw "Could not close desktop window" }
+            if (-not $desktop.WaitForExit(30000)) { throw "Desktop did not shut down" }
+            if ($desktop.ExitCode -ne 0) { throw "Desktop exit code: $($desktop.ExitCode)" }
+          } finally {
+            if (-not $desktop.HasExited) { Stop-Process -Id $desktop.Id -Force }
+            foreach ($log in @($stdout, $stderr)) {
+              if (Test-Path $log) { Get-Content $log }
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cashew-windows-x86_64
+          if-no-files-found: error
+          path: |
+            target/release/cashew.exe
+            target/release/bazel-cache-server.exe

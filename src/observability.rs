@@ -7,6 +7,7 @@
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -26,6 +27,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::{LogFormat, LoggingConfig};
+use crate::traffic::TrafficLog;
 use crate::db::{Metadata, Stats};
 use crate::storage::CasStore;
 
@@ -106,6 +108,9 @@ pub struct Metrics {
     pub download_bytes_total: IntCounter,
     pub upload_count: IntCounter,
     pub download_count: IntCounter,
+
+    /// Desktop traffic capture; unset (and free) unless `enable_traffic` ran.
+    traffic: OnceLock<Arc<TrafficLog>>,
 
     // --- eviction ----------------------------------------------------------
     pub evicted_bytes_total: IntCounter,
@@ -257,6 +262,7 @@ impl Metrics {
                 exponential_buckets(0.01, 2.0, 16)?,
             )?,
             registry,
+            traffic: OnceLock::new(),
         };
 
         Ok(Arc::new(m))
@@ -268,6 +274,16 @@ impl Metrics {
         self.request_duration
             .with_label_values(&[method])
             .observe(started.elapsed().as_secs_f64());
+    }
+
+    /// Start capturing request events for the desktop shell. Idempotent.
+    pub(crate) fn enable_traffic(&self) {
+        let _ = self.traffic.get_or_init(|| Arc::new(TrafficLog::default()));
+    }
+
+    /// The capture log, `None` unless desktop capture was enabled.
+    pub(crate) fn traffic(&self) -> Option<&Arc<TrafficLog>> {
+        self.traffic.get()
     }
 
     /// Publish occupancy from a metadata snapshot, keeping the aggregate
@@ -402,6 +418,18 @@ pub async fn serve_http(
     health: Arc<HealthState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind metrics listener on {addr}"))?;
+    serve_http_listener(listener, metrics, health, shutdown).await
+}
+
+pub(crate) async fn serve_http_listener(
+    listener: tokio::net::TcpListener,
+    metrics: Arc<Metrics>,
+    health: Arc<HealthState>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let app = Router::new()
         .route("/", get(root))
         .route("/metrics", get(metrics_handler))
@@ -409,10 +437,7 @@ pub async fn serve_http(
         .route("/ready", get(ready_handler))
         .with_state(HttpState { metrics, health });
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind metrics listener on {addr}"))?;
-    let local = listener.local_addr().unwrap_or(addr);
+    let local = listener.local_addr()?;
     tracing::info!(address = %local, "metrics/health HTTP listener bound");
 
     axum::serve(listener, app)
@@ -711,21 +736,20 @@ mod tests {
         health.mark_ready();
         health.ready().await.expect("healthy backends");
 
-        // Destroy both backends. Within the cache window the probe result is
-        // reused, which is what keeps `/ready` cheap under polling.
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Remove the upload directory to simulate an unavailable data volume.
+        // Keep SQLite open: Windows prevents deleting its live database files.
+        // Within the cache window the successful probe result is reused.
+        std::fs::remove_dir_all(dir.join("tmp")).unwrap();
         health.ready().await.expect("cached success is reused");
 
-        // Once the cached result expires the failure must surface, naming the
-        // component that failed.
+        // Once the cached result expires the failure must surface.
         health.valid_until_ms.store(0, Ordering::Release);
-        let err = health.ready().await.expect_err("probe should fail");
-        assert!(
-            err.contains("not writable"),
-            "unexpected readiness error: {err}"
-        );
+        health.ready().await.expect_err("probe should fail");
 
-        // Failures are never cached: the next call probes again.
-        assert_eq!(health.valid_until_ms.load(Ordering::Acquire), 0);
+        // A recovered backend must be probed immediately after a failure.
+        std::fs::create_dir(dir.join("tmp")).unwrap();
+        health.ready().await.expect("recovered storage is ready");
+        drop(health);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

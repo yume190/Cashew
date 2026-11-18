@@ -19,7 +19,11 @@ use prost::Message as _;
 use tonic::{Request, Response, Status};
 use tracing::warn;
 
-use super::{ServiceContext, check_digest_function, internal, parse_digest, stat_many};
+use super::{
+    ServiceContext, check_digest_function, digest_label, internal, parse_digest, result_status,
+    stat_many,
+};
+use crate::traffic::TrafficKind;
 use crate::digest::Digest;
 use crate::proto::reapi::action_cache_server::ActionCache;
 use crate::proto::reapi::{ActionResult, GetActionResultRequest, UpdateActionResultRequest};
@@ -254,8 +258,16 @@ impl ActionCache for ActionCacheSvc {
         request: Request<GetActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
         let started = Instant::now();
-        let out = self.get_inner(request.into_inner()).await;
+        let session = self.ctx.session_of(&request);
+        let request = request.into_inner();
+        let label = if self.ctx.tracing_traffic() {
+            digest_label(request.action_digest.as_ref())
+        } else {
+            String::new()
+        };
+        let out = self.get_inner(request).await;
         self.ctx.metrics.observe_request("ActionCache.GetActionResult", started);
+        self.ctx.trace(crate::traffic::RequestTrace { session, started }, TrafficKind::Query, "ActionCache.GetActionResult", result_status(&out), out.as_ref().map_or(0, |r| r.encoded_len() as u64), || label);
         out.map(Response::new)
     }
 
@@ -264,10 +276,18 @@ impl ActionCache for ActionCacheSvc {
         request: Request<UpdateActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
         let started = Instant::now();
+        let session = self.ctx.session_of(&request);
         let principal = crate::service::principal_label(&request);
-        let out = self.update_inner(request.into_inner()).await;
+        let request = request.into_inner();
+        let label = if self.ctx.tracing_traffic() {
+            digest_label(request.action_digest.as_ref())
+        } else {
+            String::new()
+        };
+        let out = self.update_inner(request).await;
         tracing::debug!(%principal, ok = out.is_ok(), "UpdateActionResult");
         self.ctx.metrics.observe_request("ActionCache.UpdateActionResult", started);
+        self.ctx.trace(crate::traffic::RequestTrace { session, started }, TrafficKind::Upload, "ActionCache.UpdateActionResult", result_status(&out), out.as_ref().map_or(0, |r| r.encoded_len() as u64), || label);
         out.map(Response::new)
     }
 }

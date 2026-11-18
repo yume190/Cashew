@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -118,8 +119,8 @@ fn random_token() -> String {
     format!("{hi:016x}{lo:016x}")
 }
 
-/// `ctime` is the publication time of a CAS entry: `rename(2)` into the CAS
-/// updates it, and it cannot be back-dated by a client-supplied mtime.
+/// Reindex uses Unix change time or Windows creation time (the upload's start).
+#[cfg(unix)]
 fn created_at_micros(meta: &std::fs::Metadata) -> i64 {
     let secs = meta.ctime();
     let nanos = meta.ctime_nsec();
@@ -131,6 +132,51 @@ fn created_at_micros(meta: &std::fs::Metadata) -> i64 {
         .saturating_add(meta.mtime_nsec() / 1_000)
 }
 
+#[cfg(windows)]
+fn created_at_micros(meta: &std::fs::Metadata) -> i64 {
+    meta.created().or_else(|_| meta.modified()).ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|time| time.as_micros().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn volume_id(meta: &std::fs::Metadata, _path: &Path) -> io::Result<u64> {
+    Ok(meta.dev())
+}
+
+#[cfg(windows)]
+fn volume_id(_meta: &std::fs::Metadata, path: &Path) -> io::Result<u64> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+    };
+    let file = std::fs::OpenOptions::new().read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // The handle remains valid and `info` is writable for the entire call.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(info.dwVolumeSerialNumber))
+}
+
+#[cfg(windows)]
+async fn publish_file(source: &Path, destination: &Path, strict: bool) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    tokio::task::spawn_blocking(move || {
+        let flags = if strict { MOVEFILE_WRITE_THROUGH } else { 0 };
+        // NUL-terminated paths remain alive; no COPY_ALLOWED or REPLACE_EXISTING.
+        if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+            Err(io::Error::last_os_error())
+        } else { Ok(()) }
+    }).await.map_err(io::Error::other)?
+}
+
+#[cfg(unix)]
 async fn fsync_dir(path: &Path) -> io::Result<()> {
     let dir = fs::File::open(path).await?;
     dir.sync_all().await
@@ -171,11 +217,15 @@ impl Inner {
             .expect("CAS path always has a shard directory")
             .to_path_buf();
         fs::create_dir_all(&shard_dir).await?;
-        fs::rename(tmp_path, &final_path).await?;
-
-        if self.durability == Durability::Strict {
-            fsync_dir(&shard_dir).await?;
+        #[cfg(unix)]
+        {
+            fs::rename(tmp_path, &final_path).await?;
+            if self.durability == Durability::Strict {
+                fsync_dir(&shard_dir).await?;
+            }
         }
+        #[cfg(windows)]
+        publish_file(tmp_path, &final_path, self.durability == Durability::Strict).await?;
         Ok(WriteOutcome::Published {
             size_bytes: written,
         })
@@ -216,14 +266,12 @@ impl CasStore {
 
         let cas_meta = fs::metadata(cas_dir).await?;
         let tmp_meta = fs::metadata(tmp_dir).await?;
-        if cas_meta.dev() != tmp_meta.dev() {
+        let cas_volume = volume_id(&cas_meta, cas_dir)?;
+        let tmp_volume = volume_id(&tmp_meta, tmp_dir)?;
+        if cas_volume != tmp_volume {
             return Err(io::Error::other(format!(
-                "cas dir {} (dev {}) and tmp dir {} (dev {}) are on different filesystems; \
-                 atomic publish requires one volume",
-                cas_dir.display(),
-                cas_meta.dev(),
-                tmp_dir.display(),
-                tmp_meta.dev()
+                "cas dir {} and tmp dir {} are on different filesystems; atomic publish requires one volume",
+                cas_dir.display(), tmp_dir.display()
             )));
         }
 
