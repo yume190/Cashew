@@ -62,12 +62,17 @@ jobs:
             [void][Native.Win32]::FreeLibrary($module)
           }
           Write-Host "Embedded icon groups: $iconCount"
-          $desktop = Start-Process .\target\release\cashew.exe -PassThru
+          $stdout = Join-Path $env:RUNNER_TEMP "cashew-desktop-stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "cashew-desktop-stderr.log"
+          $desktop = Start-Process .\target\release\cashew.exe -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
           try {
-            if (-not $desktop.WaitForInputIdle(30000)) { throw "Desktop did not become idle" }
-            $desktop.Refresh()
-            if ($desktop.HasExited -or $desktop.MainWindowHandle -eq 0) {
-              throw "Desktop exited or did not open a native window"
+            $startup = [Diagnostics.Stopwatch]::StartNew()
+            while ($true) {
+              $desktop.Refresh()
+              if ($desktop.HasExited) { throw "Desktop exited during startup: $($desktop.ExitCode)" }
+              if ($desktop.MainWindowHandle -ne [IntPtr]::Zero) { break }
+              if ($startup.Elapsed.TotalSeconds -ge 30) { throw "Desktop did not open a native window within 30 seconds" }
+              Start-Sleep -Milliseconds 100
             }
             Write-Host "Native window: $($desktop.MainWindowTitle), PID: $($desktop.Id)"
             $classIcon = [Native.Win32]::GetClassLongPtr($desktop.MainWindowHandle, -14)
@@ -80,6 +85,9 @@ jobs:
             if ($desktop.ExitCode -ne 0) { throw "Desktop exit code: $($desktop.ExitCode)" }
           } finally {
             if (-not $desktop.HasExited) { Stop-Process -Id $desktop.Id -Force }
+            foreach ($log in @($stdout, $stderr)) {
+              if (Test-Path $log) { Get-Content $log }
+            }
           }
       - uses: actions/upload-artifact@v4
         with:
