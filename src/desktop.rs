@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +15,8 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::config::{Config, Overrides, parse_size};
 use crate::observability::Metrics;
 use crate::server;
+pub use crate::traffic::{TrafficEvent, TrafficKind, TrafficSession};
+use crate::traffic::TrafficLog;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -89,6 +92,19 @@ pub struct DesktopSnapshot {
     pub endpoint: Option<String>,
     pub uptime_secs: u64,
     pub logs: Vec<String>,
+    pub upload_requests: u64,
+    pub query_requests: u64,
+    pub download_requests: u64,
+    /// Real socket bytes (HTTP/2 and TLS included, TCP/IP headers excluded).
+    pub network_uploaded_bytes: u64,
+    pub network_downloaded_bytes: u64,
+    pub network_upload_bytes_per_sec: f64,
+    pub network_download_bytes_per_sec: f64,
+    /// Newest first; every live session plus the latest 200 closed.
+    pub sessions: Vec<TrafficSession>,
+    pub selected_session_id: Option<u64>,
+    /// Selected session's operations only, newest first, at most 200.
+    pub events: Vec<TrafficEvent>,
 }
 
 enum Command {
@@ -103,6 +119,8 @@ pub struct DesktopController {
     commands: mpsc::UnboundedSender<Command>,
     state: Arc<Mutex<DesktopSnapshot>>,
     logs: Logs,
+    /// Requested session id; 0 means newest.
+    selection: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -111,7 +129,9 @@ impl DesktopController {
         let (commands, rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(DesktopSnapshot::default()));
         let logs = Arc::new(Mutex::new(VecDeque::new()));
+        let selection = Arc::new(AtomicU64::new(0));
         let worker_state = state.clone();
+        let worker_selection = selection.clone();
         let writer = LogSink(logs.clone());
         let thread = std::thread::Builder::new()
             .name("cashew-service".into())
@@ -126,7 +146,7 @@ impl DesktopController {
                         .enable_all()
                         .build()
                     {
-                        Ok(runtime) => runtime.block_on(worker(rx, worker_state)),
+                        Ok(runtime) => runtime.block_on(worker(rx, worker_state, worker_selection)),
                         Err(error) => {
                             fail(&worker_state, format!("Creating service runtime: {error}"))
                         }
@@ -138,6 +158,7 @@ impl DesktopController {
             commands,
             state,
             logs,
+            selection,
             thread: Some(thread),
         })
     }
@@ -147,6 +168,7 @@ impl DesktopController {
         if !matches!(state.phase, ServicePhase::Stopped | ServicePhase::Failed) {
             bail!("Service is already active");
         }
+        self.selection.store(0, Ordering::Relaxed);
         *state = DesktopSnapshot {
             phase: ServicePhase::Starting,
             ..Default::default()
@@ -165,6 +187,12 @@ impl DesktopController {
             state.phase = ServicePhase::Stopping;
             let _ = self.commands.send(Command::Stop);
         }
+    }
+
+    /// Select a captured session for the event list; `None` selects the newest.
+    /// The snapshot reflects it on the next 500 ms sample.
+    pub fn select_session(&self, id: Option<u64>) {
+        self.selection.store(id.unwrap_or(0), Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> DesktopSnapshot {
@@ -190,9 +218,33 @@ fn fail(state: &Mutex<DesktopSnapshot>, error: String) {
     state.error = Some(error);
 }
 
+/// Copy the capture log into the snapshot: totals, every retained session, and
+/// only the selected session's events. A requested session that has been evicted
+/// falls back to the newest one and the request is cleared.
+fn publish_traffic(state: &mut DesktopSnapshot, traffic: &TrafficLog, selection: &AtomicU64) {
+    let totals = traffic.totals();
+    state.upload_requests = totals.upload;
+    state.query_requests = totals.query;
+    state.download_requests = totals.download;
+    state.network_uploaded_bytes = totals.network_uploaded;
+    state.network_downloaded_bytes = totals.network_downloaded;
+    let requested = match selection.load(Ordering::Relaxed) {
+        0 => None,
+        id => Some(id),
+    };
+    let snapshot = traffic.snapshot(requested);
+    if let Some(id) = requested.filter(|id| snapshot.selected_session_id != Some(*id)) {
+        let _ = selection.compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    state.sessions = snapshot.sessions;
+    state.selected_session_id = snapshot.selected_session_id;
+    state.events = snapshot.events;
+}
+
 async fn worker(
     mut commands: mpsc::UnboundedReceiver<Command>,
     state: Arc<Mutex<DesktopSnapshot>>,
+    selection: Arc<AtomicU64>,
 ) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut job: Option<tokio::task::JoinHandle<Result<()>>> = None;
@@ -200,18 +252,20 @@ async fn worker(
     let mut ready: Option<oneshot::Receiver<server::Ready>> = None;
     let mut metrics: Option<Arc<Metrics>> = None;
     let mut started = Instant::now();
+    let mut last_sample = started;
+    let mut last_network = (0u64, 0u64);
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     loop {
         tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::Start(settings)) if job.is_none() => {
+                    metrics = None;
                     match settings.config() {
                         Ok(cfg) => {
                             let (tx, rx) = watch::channel(false);
                             let (ready_tx, ready_rx) = oneshot::channel();
                             stop = Some(tx);
                             ready = Some(ready_rx);
-                            metrics = None;
                             job = Some(tokio::spawn(server::run(Arc::new(cfg), rx, Some(ready_tx))));
                         }
                         Err(error) => fail(&state, format!("{error:#}")),
@@ -237,8 +291,10 @@ async fn worker(
                 if let Ok(result) = result {
                     metrics = Some(result.metrics);
                     started = Instant::now();
+                    last_sample = started;
+                    last_network = (0, 0);
                     let mut state = state.lock().unwrap();
-                    state.endpoint = Some(result.endpoint);
+                    state.endpoint = result.endpoint;
                     if state.phase == ServicePhase::Starting { state.phase = ServicePhase::Running; }
                 }
             }
@@ -251,7 +307,22 @@ async fn worker(
                 job = None;
                 ready = None;
                 stop = None;
-                metrics = None;
+                // The server has returned, so every socket is closed: publish the
+                // final session states and stop all rates.
+                if let Some(metrics) = &metrics
+                    && let Some(traffic) = metrics.traffic() {
+                    let mut state = state.lock().unwrap();
+                    publish_traffic(&mut state, traffic, &selection);
+                }
+                {
+                    let mut state = state.lock().unwrap();
+                    state.network_upload_bytes_per_sec = 0.0;
+                    state.network_download_bytes_per_sec = 0.0;
+                    for session in &mut state.sessions {
+                        session.upload_bytes_per_sec = 0.0;
+                        session.download_bytes_per_sec = 0.0;
+                    }
+                }
                 match result {
                     Ok(Ok(())) => state.lock().unwrap().phase = ServicePhase::Stopped,
                     Ok(Err(error)) => fail(&state, format!("{error:#}")),
@@ -268,7 +339,29 @@ async fn worker(
                     state.misses = metrics.cas_miss_total.get() + metrics.ac_miss_total.get();
                     state.uploaded_bytes = metrics.upload_bytes_total.get();
                     state.downloaded_bytes = metrics.download_bytes_total.get();
-                    state.uptime_secs = started.elapsed().as_secs();
+                    if job.is_some() {
+                        state.uptime_secs = started.elapsed().as_secs();
+                    }
+                    // Real elapsed time between samples; tick jitter cannot skew the rate.
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(last_sample).as_secs_f64();
+                    last_sample = now;
+                    if let Some(traffic) = metrics.traffic() {
+                        traffic.sample_rates(elapsed);
+                        publish_traffic(&mut state, traffic, &selection);
+                        if elapsed > 0.0 && job.is_some() {
+                            state.network_upload_bytes_per_sec = state
+                                .network_uploaded_bytes
+                                .saturating_sub(last_network.0) as f64 / elapsed;
+                            state.network_download_bytes_per_sec = state
+                                .network_downloaded_bytes
+                                .saturating_sub(last_network.1) as f64 / elapsed;
+                        } else {
+                            state.network_upload_bytes_per_sec = 0.0;
+                            state.network_download_bytes_per_sec = 0.0;
+                        }
+                        last_network = (state.network_uploaded_bytes, state.network_downloaded_bytes);
+                    }
                 }
             }
         }

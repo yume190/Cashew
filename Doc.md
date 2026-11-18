@@ -1211,6 +1211,43 @@ macOS 原生 GPUI 視窗實測：由介面啟動、停止與重新啟動服務�
 1 Action Cache result 與 8MiB 上傳/下載。另新增三個生命週期 regression tests，
 涵蓋 gRPC/metrics bind 失敗後的復原、啟動中停止、重啟及 controller drop 後釋放資源。
 
+## K. 桌面設定與流量事件
+
+服務設定將監聽範圍與 Port 分開：僅本機 `127.0.0.1`、區網 `0.0.0.0`、自訂 IP；
+儲存位置可輸入或選擇資料夾。有效內容停止輸入 400ms 後自動保存，離開時補寫待儲存內容，
+並明示保存狀態。錯誤內容不覆寫上一份設定。JSON 以同目錄暫存檔完整寫入、同步，再 atomic replace。
+外觀在「設定」頁選擇跟隨系統、淺色、深色，立即套用並保存於獨立的 `appearance.json`。
+
+區網模式仍 bind `0.0.0.0`，但總覽與複製的 client URL 使用偵測到的本機區網 IP。
+找不到可用位址時顯示原因，不提供 wildcard／loopback 的假替代連線位址。
+
+「流量／事件」以每條 TCP/gRPC 連線為 session，接受連線時建立獨立 ID，保留遠端 IP:port，
+同一 IP 的重連與同時連線不會合併。主清單顯示連線中／已關閉、雙向即時速率與累計資料量、
+Upload / Query / Download 已完成 RPC 次數；只有 Download 操作的 session 明示「僅下載」。
+點選 session 查看開始、結束、最後活動、時長，以及各次 RPC 的結果、payload、耗時與 digest／批次明細。
+保留所有使用中的 session 與最近 200 條已關閉 session，每條各保留最新 200 筆操作；
+操作累計不受明細保留上限影響。停止後仍能切換查看所有保留的 session，下一次啟動才清除。
+
+網路統計直接量測 socket 讀寫，含 HTTP/2 / TLS 通訊開銷，不含 TCP/IP 標頭；
+client → cache 是上傳，cache → client 是下載。控制訊框不算 Upload RPC，
+所以僅下載 session 仍可能有少量上行網路位元組。總覽維持 CAS payload 統計，操作明細另列 payload。
+傳輸尚未完成時就更新網路速率。ByteStream download 在真正結束、錯誤或取消時記錄事件。
+事件與 session 蒐集只在桌面啟用；CLI 不建立 session registry 或操作 ring。
+
+參考 [GlassWire](https://www.glasswire.com/userguide/)、
+[NetLimiter](https://netlimiter.com/docs/user-gui-client/child-windows/connection-log)、
+[Little Snitch](https://help.obdev.at/littlesnitch7/monitor-connection-list)：
+優先呈現連線歸屬、雙向速率／累計、連線生命週期與可展開的操作明細。
+
+本次實測一般 gRPC 與 mTLS：一條連線完成 Query ×2、Upload ×1、Download ×1，
+另一條只有 Download ×1；兩次 8MiB 下載 SHA-256 一致，串流上傳尚未完成即觀察到速率。
+個別關閉連線、明暗模式、920px／1180px 視窗、篩選及停止後切換歷史均走過原生 GPUI。
+macOS 當時鎖定且螢幕休眠，未能擷取畫面；未宣稱完成本次截圖視覺檢查。
+
+Windows 圖示由 `desktop-gpui/build.rs` 將多尺寸 `assets/cashew.ico` 嵌入 numeric resource 1，
+符合 GPUI Windows backend 的載入方式；原生 CI 同時檢查 PE resource 與視窗 class icon。
+
+
 
 ---
 

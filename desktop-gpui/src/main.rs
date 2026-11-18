@@ -1,5 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod app;
+mod appearance;
+mod persistence;
+mod traffic;
 
 use gpui_kit::*;
 
@@ -30,7 +33,7 @@ fn main() -> anyhow::Result<()> {
         // Retain the controller through the quit callback so dropping the window
         // cannot leave the service alive; its Drop joins the service thread.
         cx.on_app_quit(move |cx| {
-            view.update(cx, |view, _| view.shutdown());
+            view.update(cx, |view, cx| view.shutdown(cx));
             async {}
         })
         .detach();

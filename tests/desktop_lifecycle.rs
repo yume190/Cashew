@@ -127,3 +127,136 @@ async fn stop_during_startup_and_drop_running_controller_release_resources() {
     replacement.start(settings).unwrap();
     phase(&replacement, ServicePhase::Running).await;
 }
+
+#[allow(unused_imports)]
+#[path = "../src/proto.rs"]
+mod proto;
+
+use bazel_cache_server::desktop::DesktopSnapshot;
+use proto::reapi::{Digest, FindMissingBlobsRequest, FindMissingBlobsResponse, GetCapabilitiesRequest, ServerCapabilities};
+
+async fn snapshot_where(
+    controller: &DesktopController,
+    what: &str,
+    mut ready: impl FnMut(&DesktopSnapshot) -> bool,
+) -> DesktopSnapshot {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let snapshot = controller.snapshot();
+            if ready(&snapshot) {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}: {:?}", controller.snapshot().sessions))
+}
+
+async fn unary<Req, Resp>(grpc: &mut tonic::client::Grpc<tonic::transport::Channel>, path: &'static str, request: Req) -> Resp
+where
+    Req: prost::Message + Send + Sync + 'static,
+    Resp: prost::Message + Default + Send + Sync + 'static,
+{
+    grpc.ready().await.unwrap();
+    grpc.unary(
+        tonic::Request::new(request),
+        tonic::codegen::http::uri::PathAndQuery::from_static(path),
+        tonic_prost::ProstCodec::<Req, Resp>::default(),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+async fn connect(endpoint: &str) -> tonic::client::Grpc<tonic::transport::Channel> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    tonic::client::Grpc::new(channel)
+}
+
+const CAPABILITIES: &str = "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities";
+const FIND_MISSING: &str = "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs";
+
+async fn get_capabilities(grpc: &mut tonic::client::Grpc<tonic::transport::Channel>) {
+    unary::<_, ServerCapabilities>(grpc, CAPABILITIES, GetCapabilitiesRequest::default()).await;
+}
+
+#[tokio::test]
+async fn stopped_service_keeps_every_closed_session_selectable_until_restart() {
+    let root = TempRoot::new();
+    let settings = root.settings();
+    let mut controller = DesktopController::new().unwrap();
+    controller.start(settings.clone()).unwrap();
+    phase(&controller, ServicePhase::Running).await;
+
+    // Connection A issues two requests, connection B one, so the sessions are
+    // told apart by their real request counts.
+    let mut first = connect(&settings.listen).await;
+    get_capabilities(&mut first).await;
+    unary::<_, FindMissingBlobsResponse>(
+        &mut first,
+        FIND_MISSING,
+        FindMissingBlobsRequest {
+            blob_digests: vec![Digest { hash: "ab".repeat(32), size_bytes: 7 }],
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut second = connect(&settings.listen).await;
+    get_capabilities(&mut second).await;
+    drop((first, second));
+
+    let live = snapshot_where(&controller, "two closed sessions with 2 and 1 requests", |s| {
+        let mut counts: Vec<u64> = s.sessions.iter().map(|x| x.query_requests).collect();
+        counts.sort_unstable();
+        s.sessions.len() == 2 && counts == [1, 2] && s.sessions.iter().all(|x| x.ended_at_ms.is_some())
+    })
+    .await;
+    let id_of = |snapshot: &DesktopSnapshot, queries: u64| {
+        snapshot.sessions.iter().find(|x| x.query_requests == queries).unwrap().id
+    };
+    let (first_id, second_id) = (id_of(&live, 2), id_of(&live, 1));
+    assert_ne!(first_id, second_id);
+
+    controller.stop();
+    phase(&controller, ServicePhase::Stopped).await;
+
+    for (id, methods) in [
+        (first_id, vec!["CAS.FindMissingBlobs", "Capabilities.GetCapabilities"]),
+        (second_id, vec!["Capabilities.GetCapabilities"]),
+        (first_id, vec!["CAS.FindMissingBlobs", "Capabilities.GetCapabilities"]),
+    ] {
+        controller.select_session(Some(id));
+        let shown = snapshot_where(&controller, "stopped history of the selected session", |s| {
+            s.phase == ServicePhase::Stopped
+                && s.selected_session_id == Some(id)
+                && s.events.len() == methods.len()
+                && s.events.iter().all(|e| e.session_id == id)
+        })
+        .await;
+        let mut seen: Vec<&str> = shown.events.iter().map(|e| e.method).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, methods);
+        assert_eq!(shown.sessions.len(), 2, "closed sessions must stay listed");
+        assert_eq!(shown.network_upload_bytes_per_sec, 0.0);
+        assert_eq!(shown.network_download_bytes_per_sec, 0.0);
+        for session in &shown.sessions {
+            assert!(session.ended_at_ms.is_some());
+            assert_eq!(session.upload_bytes_per_sec, 0.0);
+            assert_eq!(session.download_bytes_per_sec, 0.0);
+        }
+    }
+
+    controller.start(settings).unwrap();
+    phase(&controller, ServicePhase::Running).await;
+    let fresh = snapshot_where(&controller, "old session history cleared by restart", |s| {
+        s.phase == ServicePhase::Running && s.sessions.is_empty() && s.events.is_empty()
+    })
+    .await;
+    assert_eq!((fresh.query_requests, fresh.upload_requests, fresh.download_requests), (0, 0, 0));
+    assert_eq!((fresh.network_uploaded_bytes, fresh.network_downloaded_bytes), (0, 0));
+}

@@ -26,7 +26,7 @@ use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 use tonic::{Request, Response, Status};
 
-use super::{ServiceContext, internal};
+use super::{ServiceContext, code_name, internal, result_status};
 use crate::digest::{Digest, HEX_LEN};
 use crate::observability::Metrics;
 use crate::proto::bytestream::byte_stream_server::ByteStream;
@@ -35,6 +35,7 @@ use crate::proto::bytestream::{
     WriteResponse,
 };
 use crate::storage::{BlobReader, StorageError};
+use crate::traffic::TrafficKind;
 
 const BLOBS: &str = "blobs";
 const COMPRESSED_BLOBS: &str = "compressed-blobs";
@@ -66,7 +67,9 @@ fn looks_like_hash(s: &str) -> bool {
 }
 
 fn malformed(name: &str, expected: &str) -> Status {
-    Status::invalid_argument(format!("malformed resource name {name:?}; expected {expected}"))
+    Status::invalid_argument(format!(
+        "malformed resource name {name:?}; expected {expected}"
+    ))
 }
 
 fn compressed_unsupported(compressor: &str) -> Status {
@@ -179,9 +182,40 @@ fn parse_write_at(segments: &[&str], i: usize, name: &str) -> Result<Option<Reso
             let Some(size) = segments.get(i + 5) else {
                 return Ok(None);
             };
-            Ok(Some(Resource { instance, digest: digest_from(hash, size, name)? }))
+            Ok(Some(Resource {
+                instance,
+                digest: digest_from(hash, size, name)?,
+            }))
         }
         _ => Ok(None),
+    }
+}
+
+/// What one `Write` call moved, for the desktop traffic list.
+#[derive(Default)]
+struct WriteProgress {
+    digest: Option<Digest>,
+    received: u64,
+}
+
+/// Reports a streaming read when the response stream ends, fails, or is
+/// dropped (client cancel), not when the stream is constructed.
+struct ReadTrace {
+    /// Session captured when the request arrived, so the event stays with the
+    /// original connection however long the stream outlives it.
+    session: Option<u64>,
+    metrics: Arc<Metrics>,
+    started: Instant,
+    detail: String,
+    bytes: u64,
+    status: &'static str,
+}
+
+impl Drop for ReadTrace {
+    fn drop(&mut self) {
+        if let Some(log) = self.metrics.traffic() {
+            log.record(crate::traffic::RequestTrace { session: self.session, started: self.started }, TrafficKind::Download, "ByteStream.Read", self.status, self.bytes, std::mem::take(&mut self.detail));
+        }
     }
 }
 
@@ -194,12 +228,24 @@ struct ReadState {
     metrics: Arc<Metrics>,
     started: Instant,
     done: bool,
+    trace: Option<ReadTrace>,
+}
+
+impl ReadState {
+    fn finish(&mut self, status: &'static str) {
+        if let Some(trace) = &mut self.trace {
+            trace.status = status;
+        }
+    }
 }
 
 impl ByteStreamSvc {
-    /// The upload state machine, generic over the request stream so it can be
-    /// driven directly in tests.
-    pub(crate) async fn write_stream<S>(&self, stream: S) -> Result<WriteResponse, Status>
+    /// `progress` reports what the client actually sent, even when the upload fails.
+    async fn write_stream<S>(
+        &self,
+        stream: S,
+        progress: &mut WriteProgress,
+    ) -> Result<WriteResponse, Status>
     where
         S: futures::Stream<Item = Result<WriteRequest, Status>> + Send,
     {
@@ -216,6 +262,7 @@ impl ByteStreamSvc {
         };
         let resource_name = first.resource_name.clone();
         let digest = parse_write_resource(&resource_name)?.digest;
+        progress.digest = Some(digest);
         let size = digest.size_bytes as u64;
 
         // Publish-if-absent (Doc §7): the CAS is immutable, so an upload of a
@@ -228,13 +275,17 @@ impl ByteStreamSvc {
             .map_err(|e| internal("stat blob", e))?
             .is_some()
         {
+            progress.received += first.data.len() as u64;
             while let Some(item) = stream.next().await {
-                if item.is_err() {
-                    break;
+                match item {
+                    Ok(message) => progress.received += message.data.len() as u64,
+                    Err(_) => break,
                 }
             }
             self.ctx.db.touch_blobs(&[digest]);
-            return Ok(WriteResponse { committed_size: digest.size_bytes });
+            return Ok(WriteResponse {
+                committed_size: digest.size_bytes,
+            });
         }
 
         let started = Instant::now();
@@ -287,6 +338,7 @@ impl ByteStreamSvc {
                 break Err(internal("write upload chunk", e));
             }
             offset += len;
+            progress.received += len;
             if message.finish_write {
                 finished = true;
                 break Ok(());
@@ -324,15 +376,20 @@ impl ByteStreamSvc {
         }
 
         let metrics = &self.ctx.metrics;
-        metrics.write_duration.observe(started.elapsed().as_secs_f64());
+        metrics
+            .write_duration
+            .observe(started.elapsed().as_secs_f64());
         metrics.upload_count.inc();
         metrics.upload_bytes_total.inc_by(size);
 
-        Ok(WriteResponse { committed_size: digest.size_bytes })
+        Ok(WriteResponse {
+            committed_size: digest.size_bytes,
+        })
     }
 
     async fn read_inner(
         &self,
+        session: Option<u64>,
         req: ReadRequest,
     ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<ReadResponse, Status>> + Send>>, Status>
     {
@@ -369,19 +426,30 @@ impl ByteStreamSvc {
             .map_err(|e| internal("open blob", e))?;
         let Some(reader) = reader else {
             self.ctx.metrics.cas_miss_total.inc();
-            return Err(Status::not_found(format!("blob {digest} is not in the CAS")));
+            return Err(Status::not_found(format!(
+                "blob {digest} is not in the CAS"
+            )));
         };
 
         self.ctx.db.touch_blobs(&[digest]);
         self.ctx.metrics.cas_hit_total.inc();
         self.ctx.metrics.download_count.inc();
 
+        let trace = self.ctx.tracing_traffic().then(|| ReadTrace {
+            session,
+            metrics: self.ctx.metrics.clone(),
+            started,
+            detail: format!("{}/{}", digest.hex(), digest.size_bytes),
+            bytes: 0,
+            status: "CANCELLED",
+        });
         let state = ReadState {
             reader,
             chunk: self.ctx.cfg.server.stream_chunk_size_bytes.max(1) as usize,
             metrics: self.ctx.metrics.clone(),
             started,
             done: false,
+            trace,
         };
 
         let stream = futures::stream::unfold(state, |mut st| async move {
@@ -390,7 +458,10 @@ impl ByteStreamSvc {
             }
             let want = st.reader.remaining().min(st.chunk as u64) as usize;
             if want == 0 {
-                st.metrics.read_duration.observe(st.started.elapsed().as_secs_f64());
+                st.metrics
+                    .read_duration
+                    .observe(st.started.elapsed().as_secs_f64());
+                st.finish("OK");
                 return None;
             }
 
@@ -402,15 +473,23 @@ impl ByteStreamSvc {
                     Ok(_) => {}
                     Err(e) => {
                         st.done = true;
-                        return Some((Err(internal("stream blob", e)), st));
+                        let status = internal("stream blob", e);
+                        st.finish(code_name(status.code()));
+                        return Some((Err(status), st));
                     }
                 }
             }
             if buf.is_empty() {
-                st.metrics.read_duration.observe(st.started.elapsed().as_secs_f64());
+                st.metrics
+                    .read_duration
+                    .observe(st.started.elapsed().as_secs_f64());
+                st.finish("OK");
                 return None;
             }
             st.metrics.download_bytes_total.inc_by(buf.len() as u64);
+            if let Some(trace) = &mut st.trace {
+                trace.bytes += buf.len() as u64;
+            }
             Some((Ok(ReadResponse { data: buf }), st))
         });
 
@@ -424,7 +503,13 @@ impl ByteStreamSvc {
         let digest = parse_write_resource(&req.resource_name)?.digest;
         // No resumable upload state is kept: an interrupted upload simply has
         // its temp file dropped, and the client restarts it from zero.
-        match self.ctx.storage.stat(&digest).await.map_err(|e| internal("stat blob", e))? {
+        match self
+            .ctx
+            .storage
+            .stat(&digest)
+            .await
+            .map_err(|e| internal("stat blob", e))?
+        {
             Some(_) => Ok(QueryWriteStatusResponse {
                 committed_size: digest.size_bytes,
                 complete: true,
@@ -445,8 +530,19 @@ impl ByteStream for ByteStreamSvc {
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
         let started = Instant::now();
-        let out = self.read_inner(request.into_inner()).await;
+        let session = self.ctx.session_of(&request);
+        let request = request.into_inner();
+        let name = if self.ctx.tracing_traffic() {
+            request.resource_name.clone()
+        } else {
+            String::new()
+        };
+        let out = self.read_inner(session, request).await;
         self.ctx.metrics.observe_request("ByteStream.Read", started);
+        // Success is reported by the response stream itself when it ends.
+        if let Err(status) = &out {
+            self.ctx.trace(crate::traffic::RequestTrace { session, started }, TrafficKind::Download, "ByteStream.Read", code_name(status.code()), 0, || name);
+        }
         out.map(Response::new)
     }
 
@@ -455,8 +551,18 @@ impl ByteStream for ByteStreamSvc {
         request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let started = Instant::now();
-        let out = self.write_stream(request.into_inner()).await;
-        self.ctx.metrics.observe_request("ByteStream.Write", started);
+        let session = self.ctx.session_of(&request);
+        let mut progress = WriteProgress::default();
+        let out = self.write_stream(request.into_inner(), &mut progress).await;
+        self.ctx
+            .metrics
+            .observe_request("ByteStream.Write", started);
+        self.ctx.trace(crate::traffic::RequestTrace { session, started }, TrafficKind::Upload, "ByteStream.Write", result_status(&out), progress.received, || {
+            progress.digest.map_or_else(
+                || "unparsed resource name".to_string(),
+                |d| format!("{}/{}", d.hex(), d.size_bytes),
+            )
+        });
         out.map(Response::new)
     }
 
@@ -465,8 +571,18 @@ impl ByteStream for ByteStreamSvc {
         request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
         let started = Instant::now();
-        let out = self.query_inner(request.into_inner()).await;
-        self.ctx.metrics.observe_request("ByteStream.QueryWriteStatus", started);
+        let session = self.ctx.session_of(&request);
+        let request = request.into_inner();
+        let name = if self.ctx.tracing_traffic() {
+            request.resource_name.clone()
+        } else {
+            String::new()
+        };
+        let out = self.query_inner(request).await;
+        self.ctx
+            .metrics
+            .observe_request("ByteStream.QueryWriteStatus", started);
+        self.ctx.trace(crate::traffic::RequestTrace { session, started }, TrafficKind::Query, "ByteStream.QueryWriteStatus", result_status(&out), 0, || name);
         out.map(Response::new)
     }
 }
@@ -474,16 +590,30 @@ impl ByteStream for ByteStreamSvc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::testutil::{TempRoot, cas_file_count, context, context_with, tmp_file_count};
+    use crate::service::testutil::{
+        TempRoot, cas_file_count, context, context_with, tmp_file_count,
+    };
     use tonic::Code;
 
     fn write_name(instance: &str, d: &Digest) -> String {
-        let prefix = if instance.is_empty() { String::new() } else { format!("{instance}/") };
-        format!("{prefix}uploads/0e4b5a1d-1111-2222-3333-444455556666/blobs/{}/{}", d.hex(), d.size_bytes)
+        let prefix = if instance.is_empty() {
+            String::new()
+        } else {
+            format!("{instance}/")
+        };
+        format!(
+            "{prefix}uploads/0e4b5a1d-1111-2222-3333-444455556666/blobs/{}/{}",
+            d.hex(),
+            d.size_bytes
+        )
     }
 
     fn read_name(instance: &str, d: &Digest) -> String {
-        let prefix = if instance.is_empty() { String::new() } else { format!("{instance}/") };
+        let prefix = if instance.is_empty() {
+            String::new()
+        } else {
+            format!("{instance}/")
+        };
         format!("{prefix}blobs/{}/{}", d.hex(), d.size_bytes)
     }
 
@@ -493,7 +623,11 @@ mod tests {
         while offset < data.len() {
             let end = (offset + chunk).min(data.len());
             out.push(Ok(WriteRequest {
-                resource_name: if offset == 0 { name.to_string() } else { String::new() },
+                resource_name: if offset == 0 {
+                    name.to_string()
+                } else {
+                    String::new()
+                },
                 write_offset: offset as i64,
                 finish_write: end == data.len(),
                 data: data[offset..end].to_vec(),
@@ -550,9 +684,12 @@ mod tests {
         assert_eq!(r.instance, "inst");
         assert_eq!(r.digest, d);
 
-        let r =
-            parse_write_resource(&format!("inst/uploads/uuid/blobs/sha256/{}/{}", d.hex(), d.size_bytes))
-                .unwrap();
+        let r = parse_write_resource(&format!(
+            "inst/uploads/uuid/blobs/sha256/{}/{}",
+            d.hex(),
+            d.size_bytes
+        ))
+        .unwrap();
         assert_eq!(r.digest, d);
     }
 
@@ -562,9 +699,17 @@ mod tests {
 
         for name in [
             format!("inst/compressed-blobs/zstd/{}/{}", d.hex(), d.size_bytes),
-            format!("inst/compressed-blobs/zstd/sha256/{}/{}", d.hex(), d.size_bytes),
+            format!(
+                "inst/compressed-blobs/zstd/sha256/{}/{}",
+                d.hex(),
+                d.size_bytes
+            ),
         ] {
-            assert_eq!(parse_read_resource(&name).unwrap_err().code(), Code::Unimplemented, "{name}");
+            assert_eq!(
+                parse_read_resource(&name).unwrap_err().code(),
+                Code::Unimplemented,
+                "{name}"
+            );
         }
         assert_eq!(
             parse_write_resource(&format!(
@@ -615,18 +760,28 @@ mod tests {
         let name = write_name("repo-a", &digest);
 
         let response = svc
-            .write_stream(futures::stream::iter(chunks(&name, &payload, 7_000)))
+            .write_stream(
+                futures::stream::iter(chunks(&name, &payload, 7_000)),
+                &mut WriteProgress::default(),
+            )
             .await
             .unwrap();
         assert_eq!(response.committed_size, digest.size_bytes);
-        assert_eq!(tmp_file_count(&root), 0, "no temp file may survive a commit");
+        assert_eq!(
+            tmp_file_count(&root),
+            0,
+            "no temp file may survive a commit"
+        );
         assert_eq!(cas_file_count(&root), 1);
         assert_eq!(ctx.db.stats().await.unwrap().cas_entry_count, 1);
         assert_eq!(ctx.metrics.upload_bytes_total.get(), payload.len() as u64);
 
         let read_back = collect_read(
             &svc,
-            ReadRequest { resource_name: read_name("repo-a", &digest), ..Default::default() },
+            ReadRequest {
+                resource_name: read_name("repo-a", &digest),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -672,7 +827,10 @@ mod tests {
 
         // A second upload of the same blob takes the publish-if-absent path.
         let again = svc
-            .write_stream(futures::stream::iter(chunks(&name, &payload, 7_000)))
+            .write_stream(
+                futures::stream::iter(chunks(&name, &payload, 7_000)),
+                &mut WriteProgress::default(),
+            )
             .await
             .unwrap();
         assert_eq!(again.committed_size, digest.size_bytes);
@@ -718,7 +876,10 @@ mod tests {
         let absent = Digest::of(b"not uploaded");
         let err = collect_read(
             &svc,
-            ReadRequest { resource_name: read_name("", &absent), ..Default::default() },
+            ReadRequest {
+                resource_name: read_name("", &absent),
+                ..Default::default()
+            },
         )
         .await
         .unwrap_err();
@@ -734,14 +895,24 @@ mod tests {
         let claimed = Digest::of(b"what the client promised");
         let name = write_name("", &claimed);
         let lie = b"something else entirely!".to_vec();
-        assert_eq!(lie.len() as i64, claimed.size_bytes, "same length, different bytes");
+        assert_eq!(
+            lie.len() as i64,
+            claimed.size_bytes,
+            "same length, different bytes"
+        );
 
         let err = svc
-            .write_stream(futures::stream::iter(chunks(&name, &lie, 8)))
+            .write_stream(
+                futures::stream::iter(chunks(&name, &lie, 8)),
+                &mut WriteProgress::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains(&claimed.hex()), "message names the expected digest");
+        assert!(
+            err.message().contains(&claimed.hex()),
+            "message names the expected digest"
+        );
         assert_eq!(tmp_file_count(&root), 0, "temp file must be removed");
         assert_eq!(cas_file_count(&root), 0, "nothing may reach the CAS");
         assert_eq!(ctx.db.stats().await.unwrap().cas_entry_count, 0);
@@ -759,12 +930,15 @@ mod tests {
 
         // No finish_write.
         let err = svc
-            .write_stream(futures::stream::iter(vec![Ok(WriteRequest {
-                resource_name: name.clone(),
-                write_offset: 0,
-                finish_write: false,
-                data: payload.clone(),
-            })]))
+            .write_stream(
+                futures::stream::iter(vec![Ok(WriteRequest {
+                    resource_name: name.clone(),
+                    write_offset: 0,
+                    finish_write: false,
+                    data: payload.clone(),
+                })]),
+                &mut WriteProgress::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
@@ -773,57 +947,70 @@ mod tests {
 
         // Non-contiguous offsets.
         let err = svc
-            .write_stream(futures::stream::iter(vec![
-                Ok(WriteRequest {
-                    resource_name: name.clone(),
-                    write_offset: 0,
-                    finish_write: false,
-                    data: payload[..4].to_vec(),
-                }),
-                Ok(WriteRequest {
-                    resource_name: String::new(),
-                    write_offset: 6,
-                    finish_write: true,
-                    data: payload[6..].to_vec(),
-                }),
-            ]))
+            .write_stream(
+                futures::stream::iter(vec![
+                    Ok(WriteRequest {
+                        resource_name: name.clone(),
+                        write_offset: 0,
+                        finish_write: false,
+                        data: payload[..4].to_vec(),
+                    }),
+                    Ok(WriteRequest {
+                        resource_name: String::new(),
+                        write_offset: 6,
+                        finish_write: true,
+                        data: payload[6..].to_vec(),
+                    }),
+                ]),
+                &mut WriteProgress::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
 
         // More bytes than the digest declares.
         let err = svc
-            .write_stream(futures::stream::iter(vec![Ok(WriteRequest {
-                resource_name: name.clone(),
-                write_offset: 0,
-                finish_write: true,
-                data: b"much longer than ten bytes".to_vec(),
-            })]))
+            .write_stream(
+                futures::stream::iter(vec![Ok(WriteRequest {
+                    resource_name: name.clone(),
+                    write_offset: 0,
+                    finish_write: true,
+                    data: b"much longer than ten bytes".to_vec(),
+                })]),
+                &mut WriteProgress::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
 
         // A contradicting resource name mid-stream.
         let err = svc
-            .write_stream(futures::stream::iter(vec![
-                Ok(WriteRequest {
-                    resource_name: name.clone(),
-                    write_offset: 0,
-                    finish_write: false,
-                    data: payload[..4].to_vec(),
-                }),
-                Ok(WriteRequest {
-                    resource_name: write_name("other", &digest),
-                    write_offset: 4,
-                    finish_write: true,
-                    data: payload[4..].to_vec(),
-                }),
-            ]))
+            .write_stream(
+                futures::stream::iter(vec![
+                    Ok(WriteRequest {
+                        resource_name: name.clone(),
+                        write_offset: 0,
+                        finish_write: false,
+                        data: payload[..4].to_vec(),
+                    }),
+                    Ok(WriteRequest {
+                        resource_name: write_name("other", &digest),
+                        write_offset: 4,
+                        finish_write: true,
+                        data: payload[4..].to_vec(),
+                    }),
+                ]),
+                &mut WriteProgress::default(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
 
-        assert_eq!(tmp_file_count(&root), 0, "every rejected upload cleans up its temp file");
+        assert_eq!(
+            tmp_file_count(&root),
+            0,
+            "every rejected upload cleans up its temp file"
+        );
         assert_eq!(cas_file_count(&root), 0);
         assert!(!ctx.storage.contains(&digest).await.unwrap());
     }
@@ -846,12 +1033,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), Code::NotFound);
 
-        svc.write_stream(futures::stream::iter(chunks(&name, &payload, 5)))
-            .await
-            .unwrap();
+        svc.write_stream(
+            futures::stream::iter(chunks(&name, &payload, 5)),
+            &mut WriteProgress::default(),
+        )
+        .await
+        .unwrap();
 
         let status = svc
-            .query_write_status(Request::new(QueryWriteStatusRequest { resource_name: name }))
+            .query_write_status(Request::new(QueryWriteStatusRequest {
+                resource_name: name,
+            }))
             .await
             .unwrap()
             .into_inner();
@@ -868,7 +1060,10 @@ mod tests {
         let empty = Digest::of(b"");
         let data = collect_read(
             &svc,
-            ReadRequest { resource_name: read_name("repo-a", &empty), ..Default::default() },
+            ReadRequest {
+                resource_name: read_name("repo-a", &empty),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -876,7 +1071,10 @@ mod tests {
 
         // Uploading it is a no-op that reports success and stores nothing.
         let response = svc
-            .write_stream(futures::stream::iter(chunks(&write_name("", &empty), &[], 8)))
+            .write_stream(
+                futures::stream::iter(chunks(&write_name("", &empty), &[], 8)),
+                &mut WriteProgress::default(),
+            )
             .await
             .unwrap();
         assert_eq!(response.committed_size, 0);

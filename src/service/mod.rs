@@ -129,6 +129,97 @@ pub(crate) fn rpc_status(code: Code, message: impl Into<String>) -> RpcStatus {
     RpcStatus { code: i32::from(code), message: message.into(), details: Vec::new() }
 }
 
+/// Canonical gRPC code name, as shown in the desktop traffic list.
+pub(crate) fn code_name(code: Code) -> &'static str {
+    match code {
+        Code::Ok => "OK",
+        Code::Cancelled => "CANCELLED",
+        Code::Unknown => "UNKNOWN",
+        Code::InvalidArgument => "INVALID_ARGUMENT",
+        Code::DeadlineExceeded => "DEADLINE_EXCEEDED",
+        Code::NotFound => "NOT_FOUND",
+        Code::AlreadyExists => "ALREADY_EXISTS",
+        Code::PermissionDenied => "PERMISSION_DENIED",
+        Code::ResourceExhausted => "RESOURCE_EXHAUSTED",
+        Code::FailedPrecondition => "FAILED_PRECONDITION",
+        Code::Aborted => "ABORTED",
+        Code::OutOfRange => "OUT_OF_RANGE",
+        Code::Unimplemented => "UNIMPLEMENTED",
+        Code::Internal => "INTERNAL",
+        Code::Unavailable => "UNAVAILABLE",
+        Code::DataLoss => "DATA_LOSS",
+        Code::Unauthenticated => "UNAUTHENTICATED",
+    }
+}
+
+/// Request-level status name of a handler result.
+pub(crate) fn result_status<T>(result: &Result<T, Status>) -> &'static str {
+    result.as_ref().map_or_else(|status| code_name(status.code()), |_| "OK")
+}
+
+/// Summary of a batch's per-entry codes: `OK` when all succeeded, `PARTIAL`
+/// when some did, otherwise the first failure's code. Also `(ok, total)`.
+pub(crate) fn batch_summary(codes: impl Iterator<Item = i32>) -> (&'static str, usize, usize) {
+    let (mut ok, mut total, mut first_error) = (0, 0, None);
+    for code in codes {
+        total += 1;
+        if code == i32::from(Code::Ok) {
+            ok += 1;
+        } else if first_error.is_none() {
+            first_error = Some(code_name(Code::from(code)));
+        }
+    }
+    let status = match first_error {
+        None => "OK",
+        Some(_) if ok > 0 => "PARTIAL",
+        Some(name) => name,
+    };
+    (status, ok, total)
+}
+
+pub(crate) fn digest_label(d: Option<&ProtoDigest>) -> String {
+    d.map_or_else(String::new, |d| format!("{}/{}", d.hash, d.size_bytes))
+}
+
+/// Batch detail: the digest for a single entry, otherwise a count summary.
+pub(crate) fn batch_detail(first: &str, ok: usize, total: usize) -> String {
+    if total == 1 {
+        first.to_string()
+    } else {
+        format!("{ok}/{total} blobs ok")
+    }
+}
+
+impl ServiceContext {
+    /// Report one finished request when desktop capture is on. `detail` is only
+    /// built in that case, so the CLI path pays one `OnceLock` read. The request
+    /// metadata keeps its original session and start time through completion.
+    pub(crate) fn trace(
+        &self,
+        request: crate::traffic::RequestTrace,
+        kind: crate::traffic::TrafficKind,
+        method: &'static str,
+        status: &'static str,
+        bytes: u64,
+        detail: impl FnOnce() -> String,
+    ) {
+        if let Some(log) = self.metrics.traffic() {
+            log.record(request, kind, method, status, bytes, detail());
+        }
+    }
+
+    pub(crate) fn tracing_traffic(&self) -> bool {
+        self.metrics.traffic().is_some()
+    }
+
+    /// The captured TCP session a request arrived on, `None` when capture is
+    /// off or the request has no mapped live connection.
+    pub(crate) fn session_of<T>(&self, request: &tonic::Request<T>) -> Option<u64> {
+        let log = self.metrics.traffic()?;
+        log.session_for_peer(request.remote_addr()?)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testutil {
     use std::path::PathBuf;
@@ -222,5 +313,19 @@ pub(crate) mod testutil {
             }
         }
         n
+    }
+}
+
+#[cfg(test)]
+mod traffic_tests {
+    use super::*;
+
+    #[test]
+    fn batch_status_distinguishes_ok_partial_and_failed() {
+        let ok = i32::from(Code::Ok);
+        let missing = i32::from(Code::NotFound);
+        assert_eq!(batch_summary([ok, ok].into_iter()), ("OK", 2, 2));
+        assert_eq!(batch_summary([ok, missing].into_iter()), ("PARTIAL", 1, 2));
+        assert_eq!(batch_summary([missing, missing].into_iter()), ("NOT_FOUND", 0, 2));
     }
 }

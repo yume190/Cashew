@@ -17,6 +17,8 @@ use super::{
     ServiceContext, check_digest_function, internal, parse_digest, rpc_ok, rpc_status, stat_many,
     to_proto_digest,
 };
+use super::{batch_detail, batch_summary, code_name, digest_label, result_status};
+use crate::traffic::TrafficKind;
 use crate::digest::Digest;
 use crate::proto::reapi::content_addressable_storage_server::ContentAddressableStorage;
 use crate::proto::reapi::{
@@ -97,7 +99,7 @@ impl CasSvc {
     async fn batch_update_inner(
         &self,
         req: BatchUpdateBlobsRequest,
-    ) -> Result<BatchUpdateBlobsResponse, Status> {
+    ) -> Result<(BatchUpdateBlobsResponse, u64), Status> {
         check_digest_function(req.digest_function)?;
 
         let limit = self.ctx.cfg.server.max_batch_total_size_bytes;
@@ -152,7 +154,7 @@ impl CasSvc {
         metrics.upload_count.inc_by(uploaded_count);
         metrics.upload_bytes_total.inc_by(uploaded_bytes);
 
-        Ok(BatchUpdateBlobsResponse { responses })
+        Ok((BatchUpdateBlobsResponse { responses }, uploaded_bytes))
     }
 
     /// Store one batch entry. The second tuple element is `Some(size)` when
@@ -291,8 +293,15 @@ impl ContentAddressableStorage for CasSvc {
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         let started = Instant::now();
-        let out = self.find_missing_inner(request.into_inner()).await;
+        let session = self.ctx.session_of(&request);
+        let request = request.into_inner();
+        let total = request.blob_digests.len();
+        let out = self.find_missing_inner(request).await;
         self.ctx.metrics.observe_request("CAS.FindMissingBlobs", started);
+        self.ctx.trace(crate::traffic::RequestTrace { session, started }, TrafficKind::Query, "CAS.FindMissingBlobs", result_status(&out), 0, || {
+            let missing = out.as_ref().map_or(0, |r| r.missing_blob_digests.len());
+            format!("{total} digests, {missing} missing")
+        });
         out.map(Response::new)
     }
 
@@ -301,9 +310,32 @@ impl ContentAddressableStorage for CasSvc {
         request: Request<BatchUpdateBlobsRequest>,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
         let started = Instant::now();
-        let out = self.batch_update_inner(request.into_inner()).await;
+        let session = self.ctx.session_of(&request);
+        let request = request.into_inner();
+        let first = if self.ctx.tracing_traffic() {
+            digest_label(request.requests.first().and_then(|r| r.digest.as_ref()))
+        } else {
+            String::new()
+        };
+        let out = self.batch_update_inner(request).await;
         self.ctx.metrics.observe_request("CAS.BatchUpdateBlobs", started);
-        out.map(Response::new)
+        let (status, bytes) = match &out {
+            Ok((response, bytes)) => (
+                batch_summary(response.responses.iter().map(|r| r.status.as_ref().map_or(0, |s| s.code))).0,
+                *bytes,
+            ),
+            Err(status) => (code_name(status.code()), 0),
+        };
+        self.ctx.trace(crate::traffic::RequestTrace { session, started }, TrafficKind::Upload, "CAS.BatchUpdateBlobs", status, bytes, || match &out {
+            Ok((response, _)) => {
+                let (_, ok, total) = batch_summary(
+                    response.responses.iter().map(|r| r.status.as_ref().map_or(0, |s| s.code)),
+                );
+                batch_detail(&first, ok, total)
+            }
+            Err(_) => first.clone(),
+        });
+        out.map(|(response, _)| Response::new(response))
     }
 
     async fn batch_read_blobs(
@@ -311,8 +343,31 @@ impl ContentAddressableStorage for CasSvc {
         request: Request<BatchReadBlobsRequest>,
     ) -> Result<Response<BatchReadBlobsResponse>, Status> {
         let started = Instant::now();
-        let out = self.batch_read_inner(request.into_inner()).await;
+        let session = self.ctx.session_of(&request);
+        let request = request.into_inner();
+        let first = if self.ctx.tracing_traffic() {
+            digest_label(request.digests.first())
+        } else {
+            String::new()
+        };
+        let out = self.batch_read_inner(request).await;
         self.ctx.metrics.observe_request("CAS.BatchReadBlobs", started);
+        self.ctx.trace(crate::traffic::RequestTrace { session, started }, TrafficKind::Download, "CAS.BatchReadBlobs", match &out {
+            Ok(response) => {
+                batch_summary(response.responses.iter().map(|r| r.status.as_ref().map_or(0, |s| s.code))).0
+            }
+            Err(status) => code_name(status.code()),
+        }, out.as_ref().map_or(0, |r| {
+            r.responses.iter().map(|e| e.data.len() as u64).sum()
+        }), || match &out {
+            Ok(response) => {
+                let (_, ok, total) = batch_summary(
+                    response.responses.iter().map(|r| r.status.as_ref().map_or(0, |s| s.code)),
+                );
+                batch_detail(&first, ok, total)
+            }
+            Err(_) => first.clone(),
+        });
         out.map(Response::new)
     }
 

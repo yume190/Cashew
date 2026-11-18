@@ -10,6 +10,7 @@ use std::time::Instant;
 use tonic::{Request, Response, Status};
 
 use super::ServiceContext;
+use crate::traffic::TrafficKind;
 use crate::proto::SemVer;
 use crate::proto::reapi::capabilities_server::Capabilities;
 use crate::proto::reapi::{
@@ -40,9 +41,15 @@ fn version(v: (i32, i32)) -> SemVer {
 impl Capabilities for CapabilitiesSvc {
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<ServerCapabilities>, Status> {
         let started = Instant::now();
+        let session = self.ctx.session_of(&request);
+        let instance = if self.ctx.tracing_traffic() {
+            request.into_inner().instance_name
+        } else {
+            String::new()
+        };
 
         let caps = ServerCapabilities {
             cache_capabilities: Some(CacheCapabilities {
@@ -78,6 +85,9 @@ impl Capabilities for CapabilitiesSvc {
         };
 
         self.ctx.metrics.observe_request("Capabilities.GetCapabilities", started);
+        self.ctx.trace(crate::traffic::RequestTrace { session, started }, TrafficKind::Query, "Capabilities.GetCapabilities", "OK", 0, || {
+            if instance.is_empty() { "default instance".to_string() } else { instance }
+        });
         Ok(Response::new(caps))
     }
 }

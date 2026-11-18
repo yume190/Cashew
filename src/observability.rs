@@ -7,6 +7,7 @@
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -26,6 +27,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::{LogFormat, LoggingConfig};
+use crate::traffic::TrafficLog;
 use crate::db::{Metadata, Stats};
 use crate::storage::CasStore;
 
@@ -106,6 +108,9 @@ pub struct Metrics {
     pub download_bytes_total: IntCounter,
     pub upload_count: IntCounter,
     pub download_count: IntCounter,
+
+    /// Desktop traffic capture; unset (and free) unless `enable_traffic` ran.
+    traffic: OnceLock<Arc<TrafficLog>>,
 
     // --- eviction ----------------------------------------------------------
     pub evicted_bytes_total: IntCounter,
@@ -257,6 +262,7 @@ impl Metrics {
                 exponential_buckets(0.01, 2.0, 16)?,
             )?,
             registry,
+            traffic: OnceLock::new(),
         };
 
         Ok(Arc::new(m))
@@ -268,6 +274,16 @@ impl Metrics {
         self.request_duration
             .with_label_values(&[method])
             .observe(started.elapsed().as_secs_f64());
+    }
+
+    /// Start capturing request events for the desktop shell. Idempotent.
+    pub(crate) fn enable_traffic(&self) {
+        let _ = self.traffic.get_or_init(|| Arc::new(TrafficLog::default()));
+    }
+
+    /// The capture log, `None` unless desktop capture was enabled.
+    pub(crate) fn traffic(&self) -> Option<&Arc<TrafficLog>> {
+        self.traffic.get()
     }
 
     /// Publish occupancy from a metadata snapshot, keeping the aggregate

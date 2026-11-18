@@ -13,6 +13,8 @@ use anyhow::{Context as _, Result};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
+use crate::traffic::ObservedIo;
+use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::service::InterceptorLayer;
 use tracing::{info, warn};
@@ -38,7 +40,7 @@ pub async fn serve(cfg: Arc<Config>, shutdown: watch::Receiver<bool>) -> Result<
 
 pub(crate) struct Ready {
     pub metrics: Arc<Metrics>,
-    pub endpoint: String,
+    pub endpoint: Option<String>,
 }
 
 pub(crate) async fn run(
@@ -57,6 +59,9 @@ pub(crate) async fn run(
     }
 
     let metrics = Metrics::new()?;
+    if ready.is_some() {
+        metrics.enable_traffic();
+    }
     let stats = db.stats().await?;
     metrics.set_cache_stats(&stats);
 
@@ -205,21 +210,23 @@ pub(crate) async fn run(
     );
     if let Some(ready) = ready {
         let address = listener.local_addr()?;
-        let address = if address.ip().is_unspecified() {
-            std::net::SocketAddr::new(
-                if address.is_ipv4() {
-                    std::net::Ipv4Addr::LOCALHOST.into()
-                } else {
-                    std::net::Ipv6Addr::LOCALHOST.into()
-                },
-                address.port(),
-            )
+        let discovered = if address.ip().is_unspecified() {
+            let result = if address.is_ipv4() {
+                local_ip_address::local_ip()
+            } else {
+                local_ip_address::local_ipv6()
+            };
+            result
+                .map_err(|error| warn!(%error, "could not discover LAN address"))
+                .ok()
         } else {
-            address
+            None
         };
+        let endpoint = client_address(address, discovered)
+            .map(|address| format!("{}://{address}", if tls_enabled { "grpcs" } else { "grpc" }));
         let _ = ready.send(Ready {
             metrics: metrics.clone(),
-            endpoint: format!("{}://{address}", if tls_enabled { "grpcs" } else { "grpc" }),
+            endpoint,
         });
     }
     let forward_shutdown = shutdown_tx.clone();
@@ -228,9 +235,24 @@ pub(crate) async fn run(
         let _ = forward_shutdown.send(true);
     });
 
+    // Every accepted socket is wrapped so the type is identical with and without
+    // capture; with capture off the wrapper only delegates.
+    let traffic = metrics.traffic().cloned();
+    let incoming = TcpListenerStream::new(listener).map(move |accepted| {
+        accepted.map(|stream| {
+            let observer = traffic.as_ref().and_then(|log| match stream.peer_addr() {
+                Ok(peer) => Some(log.open(peer)),
+                Err(error) => {
+                    warn!(%error, "peer address unavailable; connection is not captured");
+                    None
+                }
+            });
+            ObservedIo::new(stream, observer)
+        })
+    });
     let mut rx = shutdown_rx.clone();
     let serve_result = router
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+        .serve_with_incoming_shutdown(incoming, async move {
             let _ = rx.wait_for(|stop| *stop).await;
         })
         .await;
@@ -290,4 +312,39 @@ pub async fn stats(cfg: Arc<Config>) -> Result<()> {
     println!("high_watermark    {}", cfg.high_watermark_bytes());
     println!("low_watermark     {}", cfg.low_watermark_bytes());
     Ok(())
+}
+
+fn client_address(
+    listen: std::net::SocketAddr,
+    discovered: Option<std::net::IpAddr>,
+) -> Option<std::net::SocketAddr> {
+    if !listen.ip().is_unspecified() {
+        return Some(listen);
+    }
+    let ip = discovered.filter(|ip| {
+        !ip.is_unspecified() && !ip.is_loopback() && ip.is_ipv4() == listen.is_ipv4()
+    })?;
+    Some(std::net::SocketAddr::new(ip, listen.port()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_address;
+
+    #[test]
+    fn wildcard_listener_advertises_lan_address_and_keeps_configured_port() {
+        let listen = "0.0.0.0:50051".parse().unwrap();
+        let lan = "192.168.1.23".parse().unwrap();
+        assert_eq!(
+            client_address(listen, Some(lan)),
+            Some("192.168.1.23:50051".parse().unwrap())
+        );
+        assert_eq!(client_address(listen, None), None);
+        assert_eq!(
+            client_address(listen, Some("127.0.0.1".parse().unwrap())),
+            None
+        );
+        let local = "127.0.0.1:12345".parse().unwrap();
+        assert_eq!(client_address(local, Some(lan)), Some(local));
+    }
 }

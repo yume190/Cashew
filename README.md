@@ -28,14 +28,36 @@ cargo run -p cashew-desktop --bin cashew
 
 The native interface uses `gpui-kit 0.9`, matching SwiftCache's GPUI stack.
 總覽 shows CAS usage, blob/action counts, CAS + Action Cache hit rate, transfer
-bytes, uptime, and a copyable Bazel cache argument. 服務設定 configures the cache
-directory, capacity, gRPC listener, metrics listener, and an optional advanced
-TOML file. 日誌 keeps the latest 200 service log lines.
+bytes, uptime, and a copyable Bazel cache argument. 服務設定 configures the storage
+location, capacity, separate listener scopes and ports, and an optional advanced
+TOML file. Choose 僅本機 (`127.0.0.1`), 區網 (`0.0.0.0`), or a custom IP.
+流量／事件 groups traffic by accepted TCP/gRPC connection, with a unique session
+ID, remote IP:port, connected/closed state, live upload/download rates and totals,
+and separate Upload / Query / Download RPC counts. Connections from the same IP
+stay separate; download-only sessions are labelled explicitly. Select a session
+to inspect its start/end/last activity and newest 200 RPCs, including status,
+payload bytes, duration and digest/batch details. All live sessions and the latest
+200 closed sessions are retained in memory until the next service start; histories
+remain selectable after stopping. Stream download events finish when the stream
+ends or is cancelled. 日誌 keeps the latest 200 service log lines.
+
+Network totals measure socket bytes, including HTTP/2 and TLS overhead but excluding
+TCP/IP headers; the overview retains CAS payload totals. Upload means client → cache,
+and download means cache → client. A download-only RPC session can still send
+upstream protocol frames. Operation details report payload bytes separately.
 
 Start/stop runs the same cache engine inside the desktop process. Closing the
 window quits the app, drains the service, flushes access timestamps, and releases
 its listeners. No separate server executable is needed. Settings are locked
 while the service starts, runs, or stops; the service does not auto-start.
+Valid service settings save automatically 400 ms after editing; pending edits
+are also saved when quitting. The form reports pending, saved and failed states.
+Invalid input preserves the last saved document. The 儲存設定 button saves immediately.
+
+設定 → 外觀 switches between system, light and dark mode. Changes apply and save
+immediately to `appearance.json`, separately from service settings, so appearance
+can change while the service is running. Both JSON preference files are replaced
+atomically after the new document has been fully written.
 
 Desktop defaults: `127.0.0.1:50051` for gRPC, `127.0.0.1:9090` for metrics,
 100 GB capacity, and a cache directory under the user's platform cache directory.
@@ -49,8 +71,11 @@ environment variables. Authentication, TLS, durability, GC and other options use
 the existing TOML schema in [`config.example.toml`](config.example.toml).
 The copied cache URL reflects whether the active service uses TLS; configure the
 certificate hostname and Bazel trust/authentication flags for TLS deployments.
-For other machines to connect, bind gRPC to `0.0.0.0:50051`, allow that port through
-the host firewall, and use the server's LAN hostname or address in Bazel.
+For other machines to connect, select 區網, allow the configured gRPC port through
+the host firewall, and copy the cache argument from 總覽. A wildcard listener is
+advertised with a discovered LAN IP (for example `192.168.1.23:50051`), never
+`0.0.0.0` or a loopback substitute. If no LAN address is available the UI reports
+that and disables copying the address.
 
 ### Windows
 
@@ -62,8 +87,11 @@ cargo build --locked --release -p cashew-desktop --bin cashew
 .\target\release\cashew.exe
 ```
 
-The desktop executable opens a native GPUI window without a console. The CLI
-remains available separately:
+The desktop executable opens a native GPUI window without a console. Its
+multi-resolution Cashew icon is embedded as Windows resource `1`, which GPUI
+uses for the window/taskbar and Explorer uses for the executable. Source artwork
+is in `desktop-gpui/assets/cashew.svg`; the checked-in ICO contains 16–256 px images.
+The CLI remains available separately:
 
 ```powershell
 cargo build --locked --release -p bazel-cache-server --bin bazel-cache-server
@@ -73,13 +101,13 @@ cargo build --locked --release -p bazel-cache-server --bin bazel-cache-server
 The Windows CLI defaults its storage root to the user's platform cache directory;
 Unix CLI/container defaults remain `/data`. CLI shutdown handles Ctrl+C and Windows
 console close/shutdown events. The Windows GitHub Actions workflow tests the cache
-engine and desktop lifecycle, builds both executables, exercises CLI `stats`, opens
-and closes the native desktop window, and uploads the executables together as
-`cashew-windows-x86_64`.
+engine and desktop lifecycle, builds both executables, exercises CLI `stats`, checks
+the embedded icon resource and native window class icon, opens and closes the
+desktop window, and uploads both executables as `cashew-windows-x86_64`.
 
-[Verified Windows build and executable download](https://github.com/yume190/Cashew/actions/runs/44065718140/artifacts/14321443088):
-92 engine tests + 3 desktop lifecycle tests passed on the native Windows runner;
-both release executables built, and the Cashew window opened and exited normally.
+[Windows builds and executable downloads](https://github.com/yume190/Cashew/actions/workflows/windows.yml?query=branch%3Agpui-desktop-windows):
+open the latest successful run and download `cashew-windows-x86_64` under Artifacts.
+Each run checks the cache engine, desktop lifecycle, preferences and native icon.
 
 ## Run
 
@@ -198,7 +226,7 @@ Logging is `tracing`, `pretty` or `json`.
 ## Tests
 
 ```bash
-cargo test -p bazel-cache-server  # engine + desktop lifecycle regressions
+cargo test --workspace          # engine, lifecycle, desktop settings and traffic
 cargo clippy --workspace --all-targets
 ```
 
